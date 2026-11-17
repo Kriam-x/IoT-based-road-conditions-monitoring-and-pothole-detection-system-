@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Road Monitor</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#f5f6f8; --card:#ffffff; --text:#1c2733; --muted:#6b7785; --border:#dde2e8; }
+  * { box-sizing: border-box; }
+  html, body { height:100%; margin:0; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; background:var(--bg); color:var(--text); display:flex; flex-direction:column; }
+  header { padding:12px 16px; background:#1c2733; color:#fff; display:flex; align-items:baseline; gap:12px; }
+  header h1 { font-size:18px; margin:0; }
+  header span { font-size:13px; opacity:.7; }
+  .layout { flex:1; display:grid; grid-template-columns:320px 1fr; min-height:0; }
+  aside { background:var(--card); border-right:1px solid var(--border); padding:14px; overflow-y:auto; }
+  #map { height:100%; min-height:320px; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin:16px 0 8px; }
+  h2:first-child { margin-top:0; }
+  label.row { display:flex; align-items:center; gap:8px; padding:5px 0; font-size:14px; cursor:pointer; }
+  .dot { width:12px; height:12px; border-radius:50%; display:inline-block; border:2px solid #fff; box-shadow:0 0 0 1px #0003; }
+  .count { margin-left:auto; color:var(--muted); font-variant-numeric:tabular-nums; }
+  select, button { font:inherit; font-size:14px; padding:6px 10px; border:1px solid var(--border); border-radius:6px; background:#fff; color:var(--text); }
+  button { cursor:pointer; } button:hover { background:#eef1f5; }
+  .btns { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  #status { font-size:12px; color:var(--muted); margin-top:10px; }
+  #status.err { color:#c62828; }
+  #list { list-style:none; padding:0; margin:0; }
+  #list li { padding:8px 6px; border-bottom:1px solid var(--border); font-size:13px; cursor:pointer; display:flex; gap:8px; align-items:flex-start; }
+  #list li:hover { background:#f0f4f8; }
+  #list small { color:var(--muted); display:block; }
+  .popup b { font-size:15px; }
+  .popup table { border-collapse:collapse; margin-top:6px; font-size:13px; }
+  .popup td { padding:1px 10px 1px 0; vertical-align:top; }
+  .popup td:first-child { color:#666; }
+  .warn { color:#b26a00; font-size:12px; margin-top:6px; }
+  @media (max-width: 800px) {
+    .layout { grid-template-columns:1fr; grid-template-rows:60vh auto; }
+    #map { order:-1; }
+    aside { border-right:none; border-top:1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Road Surface Monitor</h1>
+  <span>Detected potholes, bumps and rough road</span>
+</header>
+
+<div class="layout">
+  <aside>
+    <h2>Show event types</h2>
+    <label class="row"><input type="checkbox" class="type-filter" value="pothole" checked>
+      <span class="dot" style="background:#e53935"></span> Pothole <span class="count" id="c-pothole">0</span></label>
+    <label class="row"><input type="checkbox" class="type-filter" value="bump" checked>
+      <span class="dot" style="background:#fb8c00"></span> Bump <span class="count" id="c-bump">0</span></label>
+    <label class="row"><input type="checkbox" class="type-filter" value="rough_road" checked>
+      <span class="dot" style="background:#8e24aa"></span> Rough road <span class="count" id="c-rough_road">0</span></label>
+
+    <h2>Time range</h2>
+    <select id="range">
+      <option value="0">All time</option>
+      <option value="1">Last hour</option>
+      <option value="24" selected>Last 24 hours</option>
+      <option value="168">Last 7 days</option>
+    </select>
+
+    <div class="btns">
+      <button id="btn-refresh">Refresh</button>
+      <button id="btn-fit">Fit map to events</button>
+    </div>
+    <label class="row"><input type="checkbox" id="auto" checked> Auto-refresh every 10 s</label>
+    <div id="status">Loading…</div>
+
+    <h2>Latest events</h2>
+    <ul id="list"></ul>
+  </aside>
+  <div id="map"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  // If the dashboard is opened from a different server than the API, put the API address here.
+  const API_BASE = '';
+
+  const COLORS = { pothole: '#e53935', bump: '#fb8c00', rough_road: '#8e24aa' };
+  const LABELS = { pothole: 'Pothole', bump: 'Bump', rough_road: 'Rough road' };
+  const RADIUS = { low: 7, medium: 9, high: 12 };
+
+  const map = L.map('map').setView([20.5937, 78.9629], 5);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).addTo(map);
+
+  const layer = L.layerGroup().addTo(map);
+  const markers = new Map();
+  let firstLoad = true;
+  let lastBounds = null;
+
+  function esc(v) {
+    return String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+  const fmt = (v, d = 2, unit = '') => (v === null || v === undefined ? '–' : Number(v).toFixed(d) + unit);
+
+  function popupHtml(e) {
+    const when = new Date(e.event_time);
+    const whenTxt = isNaN(when) ? esc(e.event_time) : when.toLocaleString();
+    return `<div class="popup">
+      <b style="color:${COLORS[e.event_type]}">${esc(LABELS[e.event_type] || e.event_type)}</b>
+      ${e.severity ? ` &middot; ${esc(e.severity)} impact` : ''}
+      <table>
+        <tr><td>Time</td><td>${whenTxt}</td></tr>
+        <tr><td>Latitude</td><td>${fmt(e.latitude, 6)}</td></tr>
+        <tr><td>Longitude</td><td>${fmt(e.longitude, 6)}</td></tr>
+        <tr><td>Speed</td><td>${fmt(e.speed_kmph, 1, ' km/h')}</td></tr>
+        <tr><td>Satellites / HDOP</td><td>${e.satellites ?? '–'} / ${fmt(e.hdop, 1)}</td></tr>
+        <tr><td>Accel peak up</td><td>${fmt(e.max_g, 2, ' g')}</td></tr>
+        <tr><td>Accel peak down</td><td>${fmt(e.min_g, 2, ' g')}</td></tr>
+        <tr><td>Peak-to-peak</td><td>${fmt(e.p2p_g, 2, ' g')}</td></tr>
+        <tr><td>Tilt rate (gyro)</td><td>${fmt(e.gyro_dps, 1, ' °/s')}</td></tr>
+        <tr><td>Device</td><td>${esc(e.device_id)} (#${e.id})</td></tr>
+      </table>
+      ${e.gps_fix ? '' : '<div class="warn">⚠ Simulated position (no GPS fix during test)</div>'}
+    </div>`;
+  }
+
+  function render(events) {
+    layer.clearLayers();
+    markers.clear();
+    const counts = { pothole: 0, bump: 0, rough_road: 0 };
+    const pts = [];
+
+    events.forEach(e => {
+      counts[e.event_type] = (counts[e.event_type] || 0) + 1;
+      const m = L.circleMarker([e.latitude, e.longitude], {
+        radius: RADIUS[e.severity] || 8,
+        color: '#ffffff', weight: 2,
+        fillColor: COLORS[e.event_type] || '#555', fillOpacity: 0.9
+      }).bindPopup(popupHtml(e));
+      m.addTo(layer);
+      markers.set(e.id, m);
+      pts.push([e.latitude, e.longitude]);
+    });
+
+    Object.keys(counts).forEach(k => { document.getElementById('c-' + k).textContent = counts[k]; });
+
+    const list = document.getElementById('list');
+    list.innerHTML = '';
+    events.slice(0, 25).forEach(e => {
+      const li = document.createElement('li');
+      const dot = document.createElement('span');
+      dot.className = 'dot'; dot.style.background = COLORS[e.event_type] || '#555';
+      const box = document.createElement('div');
+      const t = new Date(e.event_time);
+      box.textContent = LABELS[e.event_type] || e.event_type;
+      const small = document.createElement('small');
+      small.textContent = (isNaN(t) ? e.event_time : t.toLocaleString()) + ' · ' + Number(e.latitude).toFixed(5) + ', ' + Number(e.longitude).toFixed(5);
+      box.appendChild(small);
+      li.append(dot, box);
+      li.addEventListener('click', () => {
+        const m = markers.get(e.id);
+        if (m) { map.setView(m.getLatLng(), Math.max(map.getZoom(), 17)); m.openPopup(); }
+      });
+      list.appendChild(li);
+    });
+
+    lastBounds = pts.length ? L.latLngBounds(pts) : null;
+    if (firstLoad && lastBounds) { map.fitBounds(lastBounds, { padding: [40, 40], maxZoom: 17 }); firstLoad = false; }
+  }
+
+  async function loadEvents() {
+    const status = document.getElementById('status');
+    const types = [...document.querySelectorAll('.type-filter:checked')].map(c => c.value);
+    if (types.length === 0) { render([]); status.className = ''; status.textContent = 'No event type selected.'; return; }
+    const qs = new URLSearchParams({ types: types.join(','), limit: '2000' });
+    const hours = document.getElementById('range').value;
+    if (hours !== '0') qs.set('since_hours', hours);
+    try {
+      const r = await fetch(`${API_BASE}/api/events?${qs}`);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      render(data.events);
+      status.className = '';
+      status.textContent = `${data.count} event(s) · updated ${new Date().toLocaleTimeString()}`;
+    } catch (err) {
+      status.className = 'err';
+      status.textContent = 'Could not load events: ' + err.message;
+    }
+  }
+
+  document.getElementById('btn-refresh').addEventListener('click', loadEvents);
+  document.getElementById('btn-fit').addEventListener('click', () => { if (lastBounds) map.fitBounds(lastBounds, { padding: [40, 40], maxZoom: 17 }); });
+  document.getElementById('range').addEventListener('change', loadEvents);
+  document.querySelectorAll('.type-filter').forEach(c => c.addEventListener('change', loadEvents));
+  setInterval(() => { if (document.getElementById('auto').checked) loadEvents(); }, 10000);
+  loadEvents();
+</script>
+</body>
+</html>
